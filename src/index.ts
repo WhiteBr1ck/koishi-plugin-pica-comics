@@ -1,4 +1,4 @@
-import { Context, Schema, Logger, h, sleep } from 'koishi'
+import { Context, Schema, Logger, h, Session, sleep } from 'koishi'
 import * as path from 'path'
 import { mkdir, writeFile, unlink, rm, readFile } from 'fs/promises' 
 import * as crypto from 'crypto'
@@ -26,6 +26,7 @@ export interface Config {
   enableCompression: boolean
   compressionQuality: number
   pdfSendMethod: 'buffer' | 'file'
+  downloadConcurrency: number
   apiHost: string
   apiKey: string
   hmacKey: string
@@ -55,7 +56,8 @@ export const Config: Schema<Config> = Schema.intersect([
       Schema.const('buffer').description('Buffer (内存模式，最高兼容性)'),
       Schema.const('file').description('File (文件路径模式，低兼容性)'),
     ]).description('PDF 发送方式。如果 Koishi 与机器人客户端不在同一台设备或 Docker 环境中，必须选择“Buffer”。').default('buffer'),
-  }).description('PDF 输出设置'),
+    downloadConcurrency: Schema.number().min(1).max(10).step(1).description('【图片/PDF模式】下载漫画图片时的并行下载数量。数值越高速度越快，但越容易被服务器拒绝。').default(4),
+  }).description('PDF 与下载设置'),
 
   Schema.object({
     debug: Schema.boolean().description('是否在控制台输出详细的调试日志。用于排查问题。').default(false),
@@ -67,6 +69,7 @@ export const Config: Schema<Config> = Schema.intersect([
     hmacKey: Schema.string().role('secret').description('Pica HMAC 签名密钥。').default('~d}$Q7$eIni=V)9\\RK/P.RM4;9[7|@/CA}b~OW!3?EV`:<>M7pddUBL5n|0/*Cn'),
   }).description('高级设置 (警告：除非你知道你在做什么，否则不要修改这些值！)'),
 ])
+
 
 export function apply(ctx: Context, config: Config) {
   let token: string | null = null
@@ -179,8 +182,8 @@ export function apply(ctx: Context, config: Config) {
         if (config.debug) logger.info(`[搜索] 开始搜索，关键词: "${keyword}"`)
         const authToken = await ensureToken()
         if (!authToken) {
-          logger.warn(`[搜索] 获取 Token 失败，无法继续搜索。`)
-          return h('quote', { id: session.messageId }) + '登录失败，无法执行操作。'
+          logger.warn(`[搜索] 获取 Token 失败，无法继续搜索。`);
+          return h('quote', { id: session.messageId }) + '登录失败，无法执行操作。';
         }
         
         const requestPath = `comics/search?page=1&q=${encodeURIComponent(keyword)}`
@@ -189,59 +192,39 @@ export function apply(ctx: Context, config: Config) {
         const response = await ctx.http.get(`${config.apiHost}/${requestPath}`, { headers })
         const result = response.data?.comics
         if (!result || !Array.isArray(result.docs) || result.docs.length === 0) {
-          if (config.debug) logger.info(`[搜索] 未找到关键词 "${keyword}" 的任何结果。`)
-          return h('quote', { id: session.messageId }) + '未找到任何结果。'
+            if (config.debug) logger.info(`[搜索] 未找到关键词 "${keyword}" 的任何结果。`);
+            return h('quote', { id: session.messageId }) + '未找到任何结果。'
         }
-
         const top10Results = result.docs.slice(0, 10);
-        if (config.debug) logger.info(`[搜索] 成功！关键词 "${keyword}" 找到 ${result.total} 个结果，将展示 ${top10Results.length} 个。`)
         
         const messageElements: h[] = [
           h('p', `搜索到 ${result.total} 个结果，为您展示前 ${top10Results.length} 个：`)
         ];
-        
-        // 如果需要显示图片，则并行下载所有图片并转为 Data URI
-        let imageElements: (h | null)[] = [];
-        if (config.showImageInSearch) {
-          if (config.debug) logger.info(`[搜索] 正在下载 ${top10Results.length} 张封面图...`)
-          const imagePromises = top10Results.map(async (comic) => {
-            if (comic.thumb && comic.thumb.fileServer && comic.thumb.path) {
-              const imageUrl = `${comic.thumb.fileServer}/static/${comic.thumb.path}`;
-              try {
-                const arrayBuffer = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' });
-                const buffer = Buffer.from(arrayBuffer);
-                const mime = imageUrl.endsWith('.png') ? 'image/png' : 'image/jpeg';
-                const dataUri = `data:${mime};base64,${buffer.toString('base64')}`;
-                return h.image(dataUri);
-              } catch (e) {
-                logger.warn(`[搜索] 下载封面失败: ${imageUrl}`, e);
-                return null; // 下载失败则返回 null
-              }
-            }
-            return null;
-          });
-          imageElements = await Promise.all(imagePromises);
-          if (config.debug) logger.info(`[搜索] 封面图下载完成。`)
-        }
-
         const numberEmojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
 
-        top10Results.forEach((comic, index) => {
+        for (const [index, comic] of top10Results.entries()) {
           messageElements.push(h('p', '──────────'));
-
           const emoji = numberEmojis[index] || `${index + 1}.`;
           const textInfo = `${emoji} [ID] ${comic._id}\n[标题] ${comic.title}\n[作者] ${comic.author}`;
           messageElements.push(h('p', textInfo));
           
-          if (imageElements[index]) {
-            messageElements.push(imageElements[index]);
+          if (config.showImageInSearch && comic.thumb?.fileServer && comic.thumb?.path) {
+            const imageUrl = `${comic.thumb.fileServer}/static/${comic.thumb.path}`;
+            try {
+              if (config.debug) logger.info(`[搜索] 正在下载封面: ${imageUrl}`);
+              const buffer = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' });
+              const mime = imageUrl.endsWith('.png') ? 'image/png' : 'image/jpeg';
+              messageElements.push(h.image(buffer, mime));
+            } catch (error) {
+              logger.warn(`[搜索] 下载封面图失败: ${imageUrl}, 错误: ${error.message}`);
+            }
           }
-        });
+        }
 
-        if (config.useForwardForSearch) {
-          await session.send(h('figure', {}, messageElements))
+        if (config.useForwardForSearch && ['qq', 'onebot'].includes(session.platform)) {
+          await session.send(h('figure', {}, messageElements));
         } else {
-          await session.send(messageElements)
+          await session.send(messageElements);
         }
 
       } catch (error) {
@@ -259,155 +242,195 @@ export function apply(ctx: Context, config: Config) {
   ctx.command('picaid <comicId:string> [chapter:string]', 'Pica 漫画下载')
     .option('output', '-o <type:string>')
     .action(async ({ session, options }, comicId, chapter) => {
-      if (!comicId) return '请输入正确的漫画 ID。'
+      if (!comicId) return '请输入正确的漫画 ID。';
       
-      const statusMessage = await session.send(h('quote', { id: session.messageId }) + `请求下载漫画 ${comicId}...`)
+      const statusMessage = await session.send(h('quote', { id: session.messageId }) + `请求下载漫画 ${comicId}...`);
       
       try {
-        const authToken = await ensureToken()
+        const authToken = await ensureToken();
         if (!authToken) {
-          return h('quote', { id: session.messageId }) + '登录失败，无法执行操作。'
+          return h('quote', { id: session.messageId }) + '登录失败，无法执行操作。';
         }
         
         const getImageUrlsForChapter = async (order: number) => {
-          const path = `comics/${comicId}/order/${order}/pages`
-          let urls: string[] = []
-          let currentPage = 1
-          let totalPages = 1
+          const path = `comics/${comicId}/order/${order}/pages`;
+          let urls: string[] = [];
+          let currentPage = 1;
+          let totalPages = 1;
           do {
-            const headers = buildHeaders('GET', `${path}?page=${currentPage}`, authToken)
-            const response = await ctx.http.get(`${config.apiHost}/${path}?page=${currentPage}`, { headers })
+            const headers = buildHeaders('GET', `${path}?page=${currentPage}`, authToken);
+            const response = await ctx.http.get(`${config.apiHost}/${path}?page=${currentPage}`, { headers });
             if (!response?.data?.pages?.docs || !Array.isArray(response.data.pages.docs)) {
-              throw new Error(`获取章节 ${order} 失败: API响应无效`)
+              throw new Error(`获取章节 ${order} 失败: API响应无效`);
             }
-            const pageData = response.data.pages
+            const pageData = response.data.pages;
             if (currentPage === 1) {
-              totalPages = pageData.pages
-              if (pageData.total === 0) return []
+              totalPages = pageData.pages;
+              if (pageData.total === 0) return [];
             }
-            const validDocs = pageData.docs.filter(doc => doc && doc.media && doc.media.fileServer && doc.media.path)
-            urls.push(...validDocs.map(doc => `${doc.media.fileServer}/static/${doc.media.path}`))
-            currentPage++
-            if (currentPage <= totalPages) await sleep(500)
-          } while (currentPage <= totalPages)
-          return urls
-        }
+            const validDocs = pageData.docs.filter(doc => doc && doc.media && doc.media.fileServer && doc.media.path);
+            urls.push(...validDocs.map(doc => `${doc.media.fileServer}/static/${doc.media.path}`));
+            currentPage++;
+            if (currentPage <= totalPages) await sleep(500);
+          } while (currentPage <= totalPages);
+          return urls;
+        };
 
         let allImageUrls: string[] = [];
         let isFullDownload = false;
         let chapterForTitle: string | number = 1;
 
         if (!chapter) {
-          if (config.debug) logger.info(`[下载] 未指定章节，默认下载第 1 话。ID: ${comicId}`)
+          if (config.debug) logger.info(`[下载] 未指定章节，默认下载第 1 话。ID: ${comicId}`);
           allImageUrls = await getImageUrlsForChapter(1);
         } else if (chapter.toLowerCase() === 'full') {
-          if (config.debug) logger.info(`[下载] full 模式启动。ID: ${comicId}`)
+          if (config.debug) logger.info(`[下载] full 模式启动。ID: ${comicId}`);
           isFullDownload = true;
           const chapters = await getComicChapters(comicId);
-          if (chapters.length === 0) return '无法获取该漫画的任何章节信息。'
+          if (chapters.length === 0) return '无法获取该漫画的任何章节信息。';
           
           for (const [index, chap] of chapters.entries()) {
-            if (config.debug) logger.info(`[下载] [Full] 正在处理第 ${index + 1}/${chapters.length} 话 (章节序号: ${chap.order})`)
+            if (config.debug) logger.info(`[下载] [Full] 正在处理第 ${index + 1}/${chapters.length} 话 (章节序号: ${chap.order})`);
             const urls = await getImageUrlsForChapter(chap.order);
             allImageUrls.push(...urls);
           }
         } else if (/^\d+$/.test(chapter)) {
           chapterForTitle = parseInt(chapter, 10);
-          if (config.debug) logger.info(`[下载] 指定下载第 ${chapterForTitle} 话。ID: ${comicId}`)
+          if (config.debug) logger.info(`[下载] 指定下载第 ${chapterForTitle} 话。ID: ${comicId}`);
           allImageUrls = await getImageUrlsForChapter(chapterForTitle);
         } else {
-          return '章节参数不合法。请输入一个数字，或 "full"。'
+          return '章节参数不合法。请输入一个数字，或 "full"。';
         }
 
         if (allImageUrls.length === 0) {
-          return h('quote', { id: session.messageId }) + '未能获取到任何图片链接，任务中止。'
+          return h('quote', { id: session.messageId }) + '未能获取到任何图片链接，任务中止。';
         }
 
         const outputType = options.output || (config.defaultToPdf ? 'pdf' : 'image');
 
         if (outputType === 'pdf') {
-          if (config.debug) logger.info(`[下载] [PDF] 已获取 ${allImageUrls.length} 张图片，准备生成。`)
+          if (config.debug) logger.info(`[下载] [PDF] 已获取 ${allImageUrls.length} 张图片，准备生成。`);
           
-          const comicInfo = await getComicInfo(comicId)
-          const comicTitle = comicInfo?.title || comicId
+          const comicInfo = await getComicInfo(comicId);
+          const comicTitle = comicInfo?.title || comicId;
           
-          const finalPart = isFullDownload ? '_全部章节' : `_第${chapterForTitle}话`
-          const safeFilename = comicTitle.replace(/[\\/:\*\?"<>\|]/g, '_') + finalPart
+          const finalPart = isFullDownload ? '_全部章节' : `_第${chapterForTitle}话`;
+          const safeFilename = comicTitle.replace(/[\\/:\*\?"<>\|]/g, '_') + finalPart;
           
-          const downloadDir = path.resolve(ctx.app.baseDir, config.downloadPath)
-          const tempPdfPath = path.resolve(downloadDir, `${safeFilename}_${Date.now()}.pdf`)
-          const tempImageDir = path.resolve(downloadDir, `temp_${comicId}_${chapter || 'full'}_${Date.now()}`)
-          await mkdir(tempImageDir, { recursive: true })
+          const downloadDir = path.resolve(ctx.app.baseDir, config.downloadPath);
+          const tempPdfPath = path.resolve(downloadDir, `${safeFilename}_${Date.now()}.pdf`);
+          const tempImageDir = path.resolve(downloadDir, `temp_${comicId}_${chapter || 'full'}_${Date.now()}`);
+          await mkdir(tempImageDir, { recursive: true });
           
           let recipe: Recipe;
           try {
             recipe = new Recipe("new", tempPdfPath, { version: 1.6 });
-            for (const [index, imageUrl] of allImageUrls.entries()) {
-                const imageName = `${index + 1}.jpg`
-                const imagePath = path.resolve(tempImageDir, imageName)
-                const imageBuffer = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' })
-                const sharpInstance = sharp(imageBuffer);
-                const jpegOptions: sharp.JpegOptions = {};
-                if (config.enableCompression) {
-                  jpegOptions.quality = config.compressionQuality;
-                }
-                await sharpInstance.jpeg(jpegOptions).toFile(imagePath);
-                const metadata = await sharp(imagePath).metadata();
-                recipe.createPage(metadata.width, metadata.height).image(imagePath, 0, 0).endPage();
+            
+            if (config.debug) logger.info(`[下载] [PDF] 开始下载并处理图片，并发数: ${config.downloadConcurrency}`);
+            const processImageTask = async (imageUrl: string, index: number) => {
+              const imageName = `${index + 1}.jpg`;
+              const imagePath = path.resolve(tempImageDir, imageName);
+              const arrayBuffer = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' });
+              const buffer = Buffer.from(arrayBuffer);
+              const sharpInstance = sharp(buffer);
+              const jpegOptions: sharp.JpegOptions = {};
+              if (config.enableCompression) {
+                jpegOptions.quality = config.compressionQuality;
+              }
+              await sharpInstance.jpeg(jpegOptions).toFile(imagePath);
+              return imagePath;
+            };
+
+            for (let i = 0; i < allImageUrls.length; i += config.downloadConcurrency) {
+              const chunk = allImageUrls.slice(i, i + config.downloadConcurrency);
+              const chunkPromises = chunk.map((url, idx) => processImageTask(url, i + idx));
+              await Promise.all(chunkPromises);
+              if (config.debug) logger.info(`[下载] [PDF] 已完成一批图片下载 (${i + chunk.length}/${allImageUrls.length})`);
             }
+
+            for (let i = 0; i < allImageUrls.length; i++) {
+              const imagePath = path.resolve(tempImageDir, `${i + 1}.jpg`);
+              const metadata = await sharp(imagePath).metadata();
+              recipe.createPage(metadata.width, metadata.height).image(imagePath, 0, 0).endPage();
+            }
+            
             if (config.pdfPassword) {
-                if (config.debug) logger.info(`[下载] [PDF] 检测到密码设置，正在加密文件: ${safeFilename}.pdf`)
+                if (config.debug) logger.info(`[下载] [PDF] 检测到密码设置，正在加密文件: ${safeFilename}.pdf`);
                 recipe.encrypt({ userPassword: config.pdfPassword, ownerPassword: config.pdfPassword });
             }
             recipe.endPDF();
             
             if (config.pdfSendMethod === 'buffer') {
-              if (config.debug) logger.info(`[下载] [PDF] 使用 Buffer 模式发送文件...`)
-              const pdfBuffer = await readFile(tempPdfPath)
-              await session.send(h.file(pdfBuffer, 'application/pdf', { title: `${safeFilename}.pdf` }))
+              if (config.debug) logger.info(`[下载] [PDF] 使用 Buffer 模式发送文件...`);
+              const pdfBuffer = await readFile(tempPdfPath);
+              await session.send(h.file(pdfBuffer, 'application/pdf', { title: `${safeFilename}.pdf` }));
             } else {
-              if (config.debug) logger.info(`[下载] [PDF] 使用 File 模式发送文件...`)
-              const fileUrl = pathToFileURL(tempPdfPath)
-              await session.send(h.file(fileUrl.href, { title: `${safeFilename}.pdf` }))
+              if (config.debug) logger.info(`[下载] [PDF] 使用 File 模式发送文件...`);
+              const fileUrl = pathToFileURL(tempPdfPath);
+              await session.send(h.file(fileUrl.href, { title: `${safeFilename}.pdf` }));
             }
             
           } finally {
             try { await unlink(tempPdfPath) } catch (e) {}
             try { await rm(tempImageDir, { recursive: true, force: true }) } catch(e) {}
           }
-        } else {
+        } else { // 图片发送模式
           if (isFullDownload) {
-            return '`full` 模式暂不支持以图片形式发送，请使用 PDF 模式。'
+            return '`full` 模式暂不支持以图片形式发送，请使用 PDF 模式。';
           }
-          if (config.debug) logger.info(`[下载] [Image] 已获取 ${allImageUrls.length} 张图片，准备发送。ID: ${comicId}, 章节: ${chapterForTitle}`)
 
-          if (config.useForwardForImages) {
-            if (config.debug) logger.info(`[下载] [Image] 采用合并转发模式发送 ${allImageUrls.length} 张图片。`)
-            const forwardElements = allImageUrls.map(url => h.image(url))
-            await session.send(h('figure', {}, forwardElements))
-          } else {
-            if (config.debug) logger.info(`[下载] [Image] 采用逐张发送模式，共 ${allImageUrls.length} 张图片。`)
+          if (config.useForwardForImages && ['qq', 'onebot'].includes(session.platform)) {
+            const forwardElements: h[] = [];
+            if (config.debug) logger.info(`[下载] [Image] 转发模式启动，准备下载 ${allImageUrls.length} 张图片，并发数: ${config.downloadConcurrency}`);
+            
+            const downloadTask = async (imageUrl: string): Promise<h | null> => {
+              try {
+                const arrayBuffer = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' });
+                const buffer = Buffer.from(arrayBuffer);
+                const mime = imageUrl.endsWith('.png') ? 'image/png' : 'image/jpeg';
+                return h.image(buffer, mime);
+              } catch (e) {
+                logger.warn(`[下载] [Image] 下载图片失败: ${imageUrl}`, e);
+                return null;
+              }
+            };
+            
+            for (let i = 0; i < allImageUrls.length; i += config.downloadConcurrency) {
+              const chunk = allImageUrls.slice(i, i + config.downloadConcurrency);
+              const chunkPromises = chunk.map(downloadTask);
+              const chunkResults = await Promise.all(chunkPromises);
+              forwardElements.push(...chunkResults.filter(el => el !== null));
+              if (config.debug) logger.info(`[下载] [Image] 已完成一批图片下载 (${i + chunk.length}/${allImageUrls.length})`);
+            }
+
+            if (forwardElements.length > 0) {
+              await session.send(h('figure', {}, forwardElements));
+            } else {
+              await session.send('所有图片都下载失败了，无法发送。');
+            }
+
+          } else { // 单张发送模式
+            if (config.debug) logger.info(`[下载] [Image] 采用逐张发送模式，共 ${allImageUrls.length} 张图片。`);
             for (const [index, imageUrl] of allImageUrls.entries()) {
               try {
-                const message = h('p', `第 ${index + 1} / ${allImageUrls.length} 张`).toString() + h.image(imageUrl).toString()
-                await session.send(message)
+                const message = h('p', `第 ${index + 1} / ${allImageUrls.length} 张`).toString() + h.image(imageUrl).toString();
+                await session.send(message);
               } catch (error) {
-                logger.warn(`[下载] 发送单张图片失败。ID: ${comicId}, 章节: ${chapterForTitle}, 图片URL: ${imageUrl}`, { error })
-                await session.send(`发送第 ${index + 1} 张图片失败，已跳过。`)
+                logger.warn(`[下载] 发送单张图片失败。ID: ${comicId}, 章节: ${chapterForTitle}, 图片URL: ${imageUrl}`, { error });
+                await session.send(`发送第 ${index + 1} 张图片失败，已跳过。`);
               }
-              await sleep(1500)
+              await sleep(1500);
             }
           }
         }
-
       } catch (error) {
-        logger.error(`[下载] 任务失败。ID: ${comicId}, 章节: ${chapter}`, { error: error.message, stack: error.stack })
-        return h('quote', { id: session.messageId }) + `下载失败：${error.message}`
+        logger.error(`[下载] 任务失败。ID: ${comicId}, 章节: ${chapter}`, { error: error.message, stack: error.stack });
+        return h('quote', { id: session.messageId }) + `下载失败：${error.message}`;
       } finally {
         try {
-          await session.bot.deleteMessage(session.channelId, statusMessage[0])
+          await session.bot.deleteMessage(session.channelId, statusMessage[0]);
         } catch (e) {
-          if (config.debug) logger.warn('撤回状态消息失败', e)
+          if (config.debug) logger.warn('撤回状态消息失败', e);
         }
       }
     })
