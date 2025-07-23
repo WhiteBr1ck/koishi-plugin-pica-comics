@@ -27,6 +27,8 @@ export interface Config {
   compressionQuality: number
   pdfSendMethod: 'buffer' | 'file'
   downloadConcurrency: number
+  downloadTimeout: number
+  downloadRetries: number
   apiHost: string
   apiKey: string
   hmacKey: string
@@ -56,7 +58,9 @@ export const Config: Schema<Config> = Schema.intersect([
       Schema.const('buffer').description('Buffer (内存模式，最高兼容性)'),
       Schema.const('file').description('File (文件路径模式，低兼容性)'),
     ]).description('PDF 发送方式。如果 Koishi 与机器人客户端不在同一台设备或 Docker 环境中，必须选择“Buffer”。').default('buffer'),
-    downloadConcurrency: Schema.number().min(1).max(10).step(1).description('【图片/PDF模式】下载漫画图片时的并行下载数量。数值越高速度越快，但越容易被服务器拒绝。').default(4),
+    downloadConcurrency: Schema.number().min(1).max(10).step(1).description('【图片/PDF模式】下载漫画图片时的并行下载数量。数值越低越稳定。').default(4),
+    downloadTimeout: Schema.number().min(1000).description('【高级】单张图片下载的超时时间（毫秒）。').default(20000),
+    downloadRetries: Schema.number().min(0).max(5).step(1).description('【高级】单张图片下载失败后的自动重试次数。').default(3),
   }).description('PDF 与下载设置'),
 
   Schema.object({
@@ -170,6 +174,26 @@ export function apply(ctx: Context, config: Config) {
     return allChapters.sort((a, b) => a.order - b.order);
   }
 
+  async function downloadImage(url: string, index: number): Promise<{ index: number; buffer: Buffer } | { index: number; error: Error }> {
+    for (let i = 0; i <= config.downloadRetries; i++) {
+      try {
+        const arrayBuffer = await ctx.http.get(url, {
+          timeout: config.downloadTimeout,
+          responseType: 'arraybuffer',
+        });
+        return { index, buffer: Buffer.from(arrayBuffer) };
+      } catch (error) {
+        if (i < config.downloadRetries) {
+          if (config.debug) logger.warn(`[下载] 图片 ${index + 1} (${url}) 下载失败 (第 ${i + 1} 次), 2秒后重试...`);
+          await sleep(2000);
+        } else {
+          logger.error(`[下载] 图片 ${index + 1} (${url}) 在重试 ${config.downloadRetries} 次后最终失败。`);
+          return { index, error };
+        }
+      }
+    }
+  }
+
   ctx.on('ready', () => login())
 
   ctx.command('picasearch <keyword:text>', 'Pica 漫画搜索 (仅展示前10个结果)')
@@ -182,8 +206,8 @@ export function apply(ctx: Context, config: Config) {
         if (config.debug) logger.info(`[搜索] 开始搜索，关键词: "${keyword}"`)
         const authToken = await ensureToken()
         if (!authToken) {
-          logger.warn(`[搜索] 获取 Token 失败，无法继续搜索。`);
-          return h('quote', { id: session.messageId }) + '登录失败，无法执行操作。';
+            logger.warn(`[搜索] 获取 Token 失败，无法继续搜索。`);
+            return h('quote', { id: session.messageId }) + '登录失败，无法执行操作。';
         }
         
         const requestPath = `comics/search?page=1&q=${encodeURIComponent(keyword)}`
@@ -197,6 +221,8 @@ export function apply(ctx: Context, config: Config) {
         }
         const top10Results = result.docs.slice(0, 10);
         
+        if (config.debug) logger.info(`[搜索] 成功！关键词 "${keyword}" 找到 ${result.total} 个结果，将展示 ${top10Results.length} 个。`);
+
         const messageElements: h[] = [
           h('p', `搜索到 ${result.total} 个结果，为您展示前 ${top10Results.length} 个：`)
         ];
@@ -210,20 +236,19 @@ export function apply(ctx: Context, config: Config) {
           
           if (config.showImageInSearch && comic.thumb?.fileServer && comic.thumb?.path) {
             const imageUrl = `${comic.thumb.fileServer}/static/${comic.thumb.path}`;
-            try {
-              if (config.debug) logger.info(`[搜索] 正在下载封面: ${imageUrl}`);
-              const buffer = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' });
+            const result = await downloadImage(imageUrl, index);
+            if ('buffer' in result) {
               const mime = imageUrl.endsWith('.png') ? 'image/png' : 'image/jpeg';
-              messageElements.push(h.image(buffer, mime));
-            } catch (error) {
-              logger.warn(`[搜索] 下载封面图失败: ${imageUrl}, 错误: ${error.message}`);
+              messageElements.push(h.image(result.buffer, mime));
             }
           }
         }
 
         if (config.useForwardForSearch && ['qq', 'onebot'].includes(session.platform)) {
+          if (config.debug) logger.info(`[搜索] 准备发送合并转发消息...`);
           await session.send(h('figure', {}, messageElements));
         } else {
+          if (config.debug) logger.info(`[搜索] 准备发送普通消息...`);
           await session.send(messageElements);
         }
 
@@ -305,6 +330,13 @@ export function apply(ctx: Context, config: Config) {
         if (allImageUrls.length === 0) {
           return h('quote', { id: session.messageId }) + '未能获取到任何图片链接，任务中止。';
         }
+        
+        const reportFailures = async (failedIndexes: number[]) => {
+          if (failedIndexes.length > 0) {
+            const sortedIndexes = failedIndexes.map(i => i + 1).sort((a, b) => a - b);
+            await session.send(`任务完成，但以下图片下载失败，已跳过：\n第 ${sortedIndexes.join(', ')} 张。`);
+          }
+        };
 
         const outputType = options.output || (config.defaultToPdf ? 'pdf' : 'image');
 
@@ -313,51 +345,48 @@ export function apply(ctx: Context, config: Config) {
           
           const comicInfo = await getComicInfo(comicId);
           const comicTitle = comicInfo?.title || comicId;
-          
           const finalPart = isFullDownload ? '_全部章节' : `_第${chapterForTitle}话`;
           const safeFilename = comicTitle.replace(/[\\/:\*\?"<>\|]/g, '_') + finalPart;
-          
           const downloadDir = path.resolve(ctx.app.baseDir, config.downloadPath);
           const tempPdfPath = path.resolve(downloadDir, `${safeFilename}_${Date.now()}.pdf`);
           const tempImageDir = path.resolve(downloadDir, `temp_${comicId}_${chapter || 'full'}_${Date.now()}`);
           await mkdir(tempImageDir, { recursive: true });
           
           let recipe: Recipe;
+          const failedImageIndexes: number[] = [];
           try {
             recipe = new Recipe("new", tempPdfPath, { version: 1.6 });
             
             if (config.debug) logger.info(`[下载] [PDF] 开始下载并处理图片，并发数: ${config.downloadConcurrency}`);
-            const processImageTask = async (imageUrl: string, index: number) => {
-              const imageName = `${index + 1}.jpg`;
-              const imagePath = path.resolve(tempImageDir, imageName);
-              const arrayBuffer = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' });
-              const buffer = Buffer.from(arrayBuffer);
-              const sharpInstance = sharp(buffer);
-              const jpegOptions: sharp.JpegOptions = {};
-              if (config.enableCompression) {
-                jpegOptions.quality = config.compressionQuality;
-              }
-              await sharpInstance.jpeg(jpegOptions).toFile(imagePath);
-              return imagePath;
-            };
-
+            
+            const successfulDownloads: { index: number; buffer: Buffer }[] = [];
             for (let i = 0; i < allImageUrls.length; i += config.downloadConcurrency) {
               const chunk = allImageUrls.slice(i, i + config.downloadConcurrency);
-              const chunkPromises = chunk.map((url, idx) => processImageTask(url, i + idx));
-              await Promise.all(chunkPromises);
-              if (config.debug) logger.info(`[下载] [PDF] 已完成一批图片下载 (${i + chunk.length}/${allImageUrls.length})`);
+              const chunkPromises = chunk.map((url, idx) => downloadImage(url, i + idx));
+              const chunkResults = await Promise.all(chunkPromises);
+              
+              for (const result of chunkResults) {
+                if ('buffer' in result) {
+                  successfulDownloads.push(result);
+                } else {
+                  failedImageIndexes.push(result.index);
+                }
+              }
+              if (config.debug) logger.info(`[下载] [PDF] 已完成一批图片下载 (${successfulDownloads.length}/${allImageUrls.length}, 失败 ${failedImageIndexes.length} 张)`);
             }
 
-            for (let i = 0; i < allImageUrls.length; i++) {
-              const imagePath = path.resolve(tempImageDir, `${i + 1}.jpg`);
+            for (const { index, buffer } of successfulDownloads) {
+              const imagePath = path.resolve(tempImageDir, `${index + 1}.jpg`);
+              const sharpInstance = sharp(buffer);
+              const jpegOptions: sharp.JpegOptions = {};
+              if (config.enableCompression) { jpegOptions.quality = config.compressionQuality; }
+              await sharpInstance.jpeg(jpegOptions).toFile(imagePath);
+              
               const metadata = await sharp(imagePath).metadata();
               recipe.createPage(metadata.width, metadata.height).image(imagePath, 0, 0).endPage();
             }
             
-            if (config.pdfPassword) {
-                if (config.debug) logger.info(`[下载] [PDF] 检测到密码设置，正在加密文件: ${safeFilename}.pdf`);
-                recipe.encrypt({ userPassword: config.pdfPassword, ownerPassword: config.pdfPassword });
-            }
+            if (config.pdfPassword) { recipe.encrypt({ userPassword: config.pdfPassword, ownerPassword: config.pdfPassword }); }
             recipe.endPDF();
             
             if (config.pdfSendMethod === 'buffer') {
@@ -373,43 +402,45 @@ export function apply(ctx: Context, config: Config) {
           } finally {
             try { await unlink(tempPdfPath) } catch (e) {}
             try { await rm(tempImageDir, { recursive: true, force: true }) } catch(e) {}
+            await reportFailures(failedImageIndexes);
           }
-        } else { // 图片发送模式
+        } else { 
           if (isFullDownload) {
             return '`full` 模式暂不支持以图片形式发送，请使用 PDF 模式。';
           }
 
           if (config.useForwardForImages && ['qq', 'onebot'].includes(session.platform)) {
             const forwardElements: h[] = [];
+            const failedImageIndexes: number[] = [];
             if (config.debug) logger.info(`[下载] [Image] 转发模式启动，准备下载 ${allImageUrls.length} 张图片，并发数: ${config.downloadConcurrency}`);
             
-            const downloadTask = async (imageUrl: string): Promise<h | null> => {
-              try {
-                const arrayBuffer = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' });
-                const buffer = Buffer.from(arrayBuffer);
-                const mime = imageUrl.endsWith('.png') ? 'image/png' : 'image/jpeg';
-                return h.image(buffer, mime);
-              } catch (e) {
-                logger.warn(`[下载] [Image] 下载图片失败: ${imageUrl}`, e);
-                return null;
-              }
-            };
-            
+            let successfulCount = 0;
             for (let i = 0; i < allImageUrls.length; i += config.downloadConcurrency) {
               const chunk = allImageUrls.slice(i, i + config.downloadConcurrency);
-              const chunkPromises = chunk.map(downloadTask);
+              const chunkPromises = chunk.map((url, idx) => downloadImage(url, i + idx));
               const chunkResults = await Promise.all(chunkPromises);
-              forwardElements.push(...chunkResults.filter(el => el !== null));
-              if (config.debug) logger.info(`[下载] [Image] 已完成一批图片下载 (${i + chunk.length}/${allImageUrls.length})`);
+
+              for (const result of chunkResults) {
+                if ('buffer' in result) {
+                  const mime = allImageUrls[result.index].endsWith('.png') ? 'image/png' : 'image/jpeg';
+                  forwardElements.push(h.image(result.buffer, mime));
+                  successfulCount++;
+                } else {
+                  failedImageIndexes.push(result.index);
+                  forwardElements.push(h('p', `第 ${result.index + 1} 张图片下载失败`));
+                }
+              }
+              if (config.debug) logger.info(`[下载] [Image] 已完成一批图片下载 (${successfulCount}/${allImageUrls.length}, 失败 ${failedImageIndexes.length} 张)`);
             }
 
             if (forwardElements.length > 0) {
+              if (config.debug) logger.info(`[下载] [Image] 所有图片处理完毕，准备发送合并转发消息。`);
               await session.send(h('figure', {}, forwardElements));
             } else {
               await session.send('所有图片都下载失败了，无法发送。');
             }
 
-          } else { // 单张发送模式
+          } else { 
             if (config.debug) logger.info(`[下载] [Image] 采用逐张发送模式，共 ${allImageUrls.length} 张图片。`);
             for (const [index, imageUrl] of allImageUrls.entries()) {
               try {
