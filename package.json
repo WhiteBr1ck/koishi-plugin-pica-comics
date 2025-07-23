@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-pica-comics",
   "description": "一个用于搜索和下载 Pica 漫画的 Koishi 插件。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [

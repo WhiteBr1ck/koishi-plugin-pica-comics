@@ -34,18 +34,18 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
-    username: Schema.string().description('PicACG 的登录用户名（注意：不是昵称）。').required(),
-    password: Schema.string().description('PicACG 的登录密码。').role('secret').required(),
+    username: Schema.string().description('Pica 登录用户名（注意：不是昵称）。').required(),
+    password: Schema.string().description('Pica 登录密码。').role('secret').required(),
   }).description('账号设置'),
 
   Schema.object({
     useForwardForSearch: Schema.boolean().description('【QQ平台】是否默认使用合并转发的形式发送【搜索结果】。').default(true),
     useForwardForImages: Schema.boolean().description('【QQ平台】当以图片形式发送漫画时，是否默认使用【合并转发】。').default(true),
-    showImageInSearch: Schema.boolean().description('是否在【搜索结果】中显示封面图片。注意：在合并转发模式下，开启此项可能会因消息过长导致发送失败。').default(true),
+    showImageInSearch: Schema.boolean().description('是否在【搜索结果】中显示封面图片。').default(true),
   }).description('消息发送设置'),
   
   Schema.object({
-    downloadPath: Schema.string().description('PDF 文件和临时文件的保存目录。').default('./data/downloads/picacg'),
+    downloadPath: Schema.string().description('PDF 文件和临时文件的保存目录。').default('./data/downloads/pica'),
     defaultToPdf: Schema.boolean().description('是否默认将漫画下载为 PDF 文件。').default(true),
     pdfPassword: Schema.string().role('secret').description('（可选）为生成的 PDF 文件设置一个打开密码。留空则不加密。'),
     enableCompression: Schema.boolean().description('【PDF模式】是否启用图片压缩以减小 PDF 文件体积。').default(true),
@@ -54,7 +54,7 @@ export const Config: Schema<Config> = Schema.intersect([
     pdfSendMethod: Schema.union([
       Schema.const('buffer').description('Buffer (内存模式，最高兼容性)'),
       Schema.const('file').description('File (文件路径模式，低兼容性)'),
-    ]).description('PDF 发送方式。如果 Koishi 与机器人客户端 (如 Napcat) 不在同一台设备或 Docker 环境中，必须选择“Buffer”。').default('buffer'),
+    ]).description('PDF 发送方式。如果 Koishi 与机器人客户端不在同一台设备或 Docker 环境中，必须选择“Buffer”。').default('buffer'),
   }).description('PDF 输出设置'),
 
   Schema.object({
@@ -62,13 +62,12 @@ export const Config: Schema<Config> = Schema.intersect([
   }).description('调试设置'),
 
   Schema.object({
-    apiHost: Schema.string().description('PicACG API 服务器地址。').default('https://picaapi.picacomic.com'),
-    apiKey: Schema.string().role('secret').description('PicACG API Key。').default('C69BAF41DA5ABD1FFEDC6D2FEA56B'),
-    hmacKey: Schema.string().role('secret').description('PicACG HMAC 签名密钥。').default('~d}$Q7$eIni=V)9\\RK/P.RM4;9[7|@/CA}b~OW!3?EV`:<>M7pddUBL5n|0/*Cn'),
+    apiHost: Schema.string().description('Pica API 服务器地址。').default('https://picaapi.picacomic.com'),
+    apiKey: Schema.string().role('secret').description('Pica API Key。').default('C69BAF41DA5ABD1FFEDC6D2FEA56B'),
+    hmacKey: Schema.string().role('secret').description('Pica HMAC 签名密钥。').default('~d}$Q7$eIni=V)9\\RK/P.RM4;9[7|@/CA}b~OW!3?EV`:<>M7pddUBL5n|0/*Cn'),
   }).description('高级设置 (警告：除非你知道你在做什么，否则不要修改这些值！)'),
 ])
 
-// --- 主入口函数 ---
 export function apply(ctx: Context, config: Config) {
   let token: string | null = null
   let tokenExpiry: number = 0
@@ -104,7 +103,6 @@ export function apply(ctx: Context, config: Config) {
       if (response?.data?.token) {
         token = response.data.token
         tokenExpiry = Date.now() + 24 * 60 * 60 * 1000
-
         if (config.debug) logger.info('登录成功！')
       } else {
         logger.warn('登录失败，API 返回数据无效:', response?.data)
@@ -171,15 +169,13 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.on('ready', () => login())
 
-  // --- 指令注册 ---
-  ctx.command('picasearch <keyword:text>', 'PicACG 漫画搜索 (仅展示前10个结果)')
+  ctx.command('picasearch <keyword:text>', 'Pica 漫画搜索 (仅展示前10个结果)')
     .action(async ({ session }, keyword) => {
       if (!keyword) return '请输入关键词。'
       
       const statusMessage = await session.send(h('quote', { id: session.messageId }) + '正在搜索...')
       
       try {
-
         if (config.debug) logger.info(`[搜索] 开始搜索，关键词: "${keyword}"`)
         const authToken = await ensureToken()
         if (!authToken) {
@@ -203,21 +199,44 @@ export function apply(ctx: Context, config: Config) {
         const messageElements: h[] = [
           h('p', `搜索到 ${result.total} 个结果，为您展示前 ${top10Results.length} 个：`)
         ];
+        
+        // 如果需要显示图片，则并行下载所有图片并转为 Data URI
+        let imageElements: (h | null)[] = [];
+        if (config.showImageInSearch) {
+          if (config.debug) logger.info(`[搜索] 正在下载 ${top10Results.length} 张封面图...`)
+          const imagePromises = top10Results.map(async (comic) => {
+            if (comic.thumb && comic.thumb.fileServer && comic.thumb.path) {
+              const imageUrl = `${comic.thumb.fileServer}/static/${comic.thumb.path}`;
+              try {
+                const arrayBuffer = await ctx.http.get(imageUrl, { responseType: 'arraybuffer' });
+                const buffer = Buffer.from(arrayBuffer);
+                const mime = imageUrl.endsWith('.png') ? 'image/png' : 'image/jpeg';
+                const dataUri = `data:${mime};base64,${buffer.toString('base64')}`;
+                return h.image(dataUri);
+              } catch (e) {
+                logger.warn(`[搜索] 下载封面失败: ${imageUrl}`, e);
+                return null; // 下载失败则返回 null
+              }
+            }
+            return null;
+          });
+          imageElements = await Promise.all(imagePromises);
+          if (config.debug) logger.info(`[搜索] 封面图下载完成。`)
+        }
 
         const numberEmojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
 
-        for (const [index, comic] of top10Results.entries()) {
+        top10Results.forEach((comic, index) => {
           messageElements.push(h('p', '──────────'));
 
           const emoji = numberEmojis[index] || `${index + 1}.`;
           const textInfo = `${emoji} [ID] ${comic._id}\n[标题] ${comic.title}\n[作者] ${comic.author}`;
           messageElements.push(h('p', textInfo));
-
-          if (config.showImageInSearch && comic.thumb && comic.thumb.fileServer && comic.thumb.path) {
-            const imageUrl = `${comic.thumb.fileServer}/static/${comic.thumb.path}`;
-            messageElements.push(h.image(imageUrl));
+          
+          if (imageElements[index]) {
+            messageElements.push(imageElements[index]);
           }
-        }
+        });
 
         if (config.useForwardForSearch) {
           await session.send(h('figure', {}, messageElements))
@@ -237,7 +256,7 @@ export function apply(ctx: Context, config: Config) {
       }
     })
 
-  ctx.command('picaid <comicId:string> [chapter:string]', 'PicACG 漫画下载')
+  ctx.command('picaid <comicId:string> [chapter:string]', 'Pica 漫画下载')
     .option('output', '-o <type:string>')
     .action(async ({ session, options }, comicId, chapter) => {
       if (!comicId) return '请输入正确的漫画 ID。'
