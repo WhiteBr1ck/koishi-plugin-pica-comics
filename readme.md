@@ -72,6 +72,8 @@
 - **downloadPath**: PDF 文件和临时文件的保存目录。（默认: `./data/downloads/pica`）
 - **defaultToPdf**: 是否默认将漫画下载为 PDF 文件。（默认开启）
 - **pdfPassword**: 为生成的 PDF 文件设置一个打开密码。留空则不加密。
+- **obfuscateTitle**: 是否开启标题混淆，以避免QQ审查拦截。（默认关闭）
+- **obfuscateSeparator**: 标题混淆时在字符之间插入的符号。（默认: `.`）
 - **enableCompression**: 是否启用图片压缩以减小 PDF 文件体积。（默认开启）
 - **compressionQuality**: JPEG 图片质量 (1-100)。（默认: 80）
 - **pdfSendMethod**: PDF 发送方式。如果 Koishi 与机器人客户端不在同一台设备或 Docker 环境中，必须选择“Buffer”。（默认: `buffer`）
@@ -83,6 +85,12 @@
 ### 高级设置
 
 - **apiHost**, **apiKey**, **hmacKey**: API 相关设置，除非你知道你在做什么，否则不要修改。
+
+## 📋 更新日志
+
+### v0.1.4 (2025-09-28)
+- 新增标题混淆功能，可避免QQ审查拦截
+- 添加可自定义的标题混淆分隔符
 
 ## 🙏 鸣谢
 

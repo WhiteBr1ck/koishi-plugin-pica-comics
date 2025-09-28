@@ -26,6 +26,8 @@ export interface Config {
   enableCompression: boolean
   compressionQuality: number
   pdfSendMethod: 'buffer' | 'file'
+  obfuscateTitle: boolean
+  obfuscateSeparator: string
   downloadConcurrency: number
   downloadTimeout: number
   downloadRetries: number
@@ -57,7 +59,9 @@ export const Config: Schema<Config> = Schema.intersect([
     pdfSendMethod: Schema.union([
       Schema.const('buffer').description('Buffer (内存模式，最高兼容性)'),
       Schema.const('file').description('File (文件路径模式，低兼容性)'),
-    ]).description('PDF 发送方式。如果 Koishi 与机器人客户端不在同一台设备或 Docker 环境中，必须选择“Buffer”。').default('buffer'),
+    ]).description('PDF 发送方式。如果 Koishi 与机器人客户端不在同一台设备或 Docker 环境中，必须选择"Buffer"。').default('buffer'),
+    obfuscateTitle: Schema.boolean().description('【PDF模式】是否开启标题混淆，以避免QQ审查拦截。').default(false),
+    obfuscateSeparator: Schema.string().description('【PDF模式】标题混淆时在字符之间插入的符号。').default('.'),
     downloadConcurrency: Schema.number().min(1).max(10).step(1).description('【图片/PDF模式】下载漫画图片时的并行下载数量。数值越低越稳定。').default(4),
     downloadTimeout: Schema.number().min(1000).description('【高级】单张图片下载的超时时间（毫秒）。').default(20000),
     downloadRetries: Schema.number().min(0).max(5).step(1).description('【高级】单张图片下载失败后的自动重试次数。').default(3),
@@ -96,6 +100,11 @@ export function apply(ctx: Context, config: Config) {
       'app-build-version': '45', 'Content-Type': 'application/json; charset=UTF-8',
       'user-agent': 'okhttp/3.8.1', ...(authToken && { 'authorization': authToken }),
     }
+  }
+
+  function obfuscateTitle(title: string): string {
+    if (!config.obfuscateTitle) return title;
+    return title.split('').join(config.obfuscateSeparator);
   }
 
   async function login(): Promise<void> {
@@ -346,7 +355,8 @@ export function apply(ctx: Context, config: Config) {
           const comicInfo = await getComicInfo(comicId);
           const comicTitle = comicInfo?.title || comicId;
           const finalPart = isFullDownload ? '_全部章节' : `_第${chapterForTitle}话`;
-          const safeFilename = comicTitle.replace(/[\\/:\*\?"<>\|]/g, '_') + finalPart;
+          const obfuscatedTitle = obfuscateTitle(comicTitle);
+          const safeFilename = obfuscatedTitle.replace(/[\\/:\*\?"<>\|]/g, '_') + finalPart;
           const downloadDir = path.resolve(ctx.app.baseDir, config.downloadPath);
           const tempPdfPath = path.resolve(downloadDir, `${safeFilename}_${Date.now()}.pdf`);
           const tempImageDir = path.resolve(downloadDir, `temp_${comicId}_${chapter || 'full'}_${Date.now()}`);
